@@ -1,0 +1,19 @@
+# Build directories
+build*/
+out/
+*.out
+*.txt
+
+# IDE / editor
+.vs/
+.vscode/
+.idea/
+*.sln
+*.vcxproj*
+
+# Generated / local
+cmake-build-*/
+*.user
+C:/Temp/
+scripts/run_*.ps1
+scripts/run_smoke.bat
