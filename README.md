@@ -33,8 +33,6 @@ The following systems are explicit non-owners; Transfer Fabric consumes them thr
 | **Compute Fabric** | Compute placement |
 | **Context Fabric / KV Fabric** | Reusable-state identity and KV/inference semantics |
 | **Reclaim Fabric / Checkpoint Fabric** | State-retention and execution-survival policy |
-| **Future Topology Fabric** | Global hardware topology modeling |
-| **Future Bandwidth Governor** | Global contention governance / bandwidth arbitration |
 
 Transfer Fabric may *consume* topology hints and bandwidth limits through interfaces, and is independently usable.
 
