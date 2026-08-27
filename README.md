@@ -91,4 +91,4 @@ cmake/                     CMake package config
 
 ## License
 
-Apache License 2.0 — see `LICENSE` and `NOTICE`.
+Apache License 2.0. Copyright 2026 Summon Software Labs. No telemetry transmission.
