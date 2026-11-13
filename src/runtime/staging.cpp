@@ -79,6 +79,23 @@ void StagingPool::adjust_high_water() noexcept {
     if (allocated_bytes_ > high_water_) high_water_ = allocated_bytes_;
 }
 
+// Cached buffers count against the capacity but can only serve a request of
+// their own size. Left alone they would exhaust the pool while nothing is in
+// use, so they are given back when a request of another size needs the room.
+void StagingPool::trim_idle(byte_count bytes) {
+    if (bytes > capacity_bytes_) return;   // can never fit: keep the cache
+    byte_count idle_bytes = 0;
+    for (const auto& f : free_list_) idle_bytes += f.first;
+    // What is in use already leaves no room: giving the cache up would not help.
+    if (idle_bytes > allocated_bytes_ || allocated_bytes_ - idle_bytes > capacity_bytes_ - bytes) return;
+    while (!free_list_.empty() && allocated_bytes_ > capacity_bytes_ - bytes) {
+        auto idle = free_list_.back();
+        free_list_.pop_back();
+        do_free(idle.second, idle.first);
+        allocated_bytes_ -= idle.first;
+    }
+}
+
 std::optional<StagingBuffer> StagingPool::allocate(byte_count bytes, bool nowait) {
     if (bytes == 0) return StagingBuffer{};
     std::lock_guard<std::mutex> g(mu_);
@@ -96,6 +113,7 @@ std::optional<StagingBuffer> StagingPool::allocate(byte_count bytes, bool nowait
         }
     }
     // need new allocation, check capacity
+    trim_idle(bytes);
     if (allocated_bytes_ + bytes > capacity_bytes_) {
         if (nowait) return std::nullopt;
         // caller uses allocate_blocking for waiting
@@ -138,6 +156,7 @@ StagingBuffer StagingPool::allocate_blocking(byte_count bytes, const std::atomic
                 return b;
             }
         }
+        trim_idle(bytes);
         if (allocated_bytes_ + bytes <= capacity_bytes_) {
             void* p = do_allocate(bytes);
             if (p == nullptr) {

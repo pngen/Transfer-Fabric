@@ -82,7 +82,8 @@ void EndpointRegistry::clear() {
 // ========================================================================
 std::shared_ptr<TransferRecord> TransferRegistry::insert(const TransferId& id, std::shared_ptr<TransferRecord> rec) {
     std::lock_guard<std::mutex> g(mu_);
-    map_[id] = rec;
+    // An id names one transfer for the life of the runtime.
+    if (!map_.emplace(id, rec).second) return nullptr;
     return rec;
 }
 std::shared_ptr<TransferRecord> TransferRegistry::find(const TransferId& id) const {

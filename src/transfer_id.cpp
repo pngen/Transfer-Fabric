@@ -1,6 +1,7 @@
 #include "transfer_fabric/transfer_id.hpp"
 
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <random>
 
@@ -11,13 +12,15 @@ namespace {
 // monotonic counter + entropy mixing keeps ids collision-resistant without
 // blocking and without relying on global random_device state.
 std::uint64_t next_entropy() {
-    static std::uint64_t counter = []() {
+    // Ids are generated from any thread: every caller takes its own step of the
+    // counter, so no two calls ever mix the same value.
+    static std::atomic<std::uint64_t> counter{[]() {
         std::random_device rd;
         std::uint64_t seed = (std::uint64_t(rd()) << 32) ^ rd();
         return seed;
-    }();
-    counter += 0x9E3779B97F4A7C15ULL;
-    std::uint64_t z = counter;
+    }()};
+    const std::uint64_t step = 0x9E3779B97F4A7C15ULL;
+    std::uint64_t z = counter.fetch_add(step, std::memory_order_relaxed) + step;
     z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
     z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
     return z ^ (z >> 31);

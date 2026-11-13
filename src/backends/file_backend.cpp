@@ -31,16 +31,29 @@ bool FileBackend::can_copy(const CopySpec& spec) const {
 }
 
 namespace {
+#if defined(_WIN32)
+// The file position of one read or write, carried by the request itself.
+OVERLAPPED at(byte_offset pos) noexcept {
+    OVERLAPPED ov{};
+    ov.Offset = static_cast<DWORD>(pos & 0xFFFFFFFFu);
+    ov.OffsetHigh = static_cast<DWORD>(pos >> 32);
+    return ov;
+}
+#endif
+
 bool read_at(std::uint64_t handle, byte_offset off, void* buf, byte_count n, byte_count* got) {
 #if defined(_WIN32)
     HANDLE h = reinterpret_cast<HANDLE>(static_cast<std::uintptr_t>(handle));
-    LARGE_INTEGER li; li.QuadPart = static_cast<LONGLONG>(off);
-    SetFilePointerEx(h, li, nullptr, FILE_BEGIN);
     byte_count total = 0;
     while (total < n) {
         DWORD chunk = static_cast<DWORD>(n - total > 1u << 30 ? (1u << 30) : (n - total));
+        // The position travels with the request. Transfers that share the
+        // endpoint share this handle, and a seek followed by a read would let
+        // one of them move the file pointer under another.
+        OVERLAPPED ov = at(off + total);
         DWORD read = 0;
-        if (!ReadFile(h, static_cast<char*>(buf) + total, chunk, &read, nullptr)) {
+        if (!ReadFile(h, static_cast<char*>(buf) + total, chunk, &read, &ov)) {
+            if (GetLastError() == ERROR_HANDLE_EOF) break; // EOF
             return false;
         }
         if (read == 0) break; // EOF
@@ -57,13 +70,12 @@ bool read_at(std::uint64_t handle, byte_offset off, void* buf, byte_count n, byt
 bool write_at(std::uint64_t handle, byte_offset off, const void* buf, byte_count n, byte_count* wrote) {
 #if defined(_WIN32)
     HANDLE h = reinterpret_cast<HANDLE>(static_cast<std::uintptr_t>(handle));
-    LARGE_INTEGER li; li.QuadPart = static_cast<LONGLONG>(off);
-    SetFilePointerEx(h, li, nullptr, FILE_BEGIN);
     byte_count total = 0;
     while (total < n) {
         DWORD chunk = static_cast<DWORD>(n - total > 1u << 30 ? (1u << 30) : (n - total));
+        OVERLAPPED ov = at(off + total);
         DWORD wr = 0;
-        if (!WriteFile(h, static_cast<const char*>(buf) + total, chunk, &wr, nullptr)) {
+        if (!WriteFile(h, static_cast<const char*>(buf) + total, chunk, &wr, &ov)) {
             return false;
         }
         if (wr == 0) break;

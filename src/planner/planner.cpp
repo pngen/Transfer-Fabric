@@ -110,6 +110,7 @@ bool is_staging_domain(MemoryDomain d) noexcept {
 bool feasible_edge(const EdgeDef& ed, const PlannerInput& in) {
     if (ed.remote && !in.remote_available) return false;
     if (!backend_known(ed.backend, in.available_backends)) return false;
+    if (!in.policy.backend_allowed(ed.backend)) return false;
     return true;
 }
 } // namespace
@@ -153,6 +154,10 @@ PlanResult DefaultRoutePlanner::plan(const PlannerInput& in) const {
         res.reason = "domain not permitted by policy";
         return res;
     }
+    if (!in.policy.persistence_permission && in.dst.capabilities.has(Capability::persistent)) {
+        res.reason = "persistent destination not permitted by policy";
+        return res;
+    }
     if (in.bytes == 0) {
         // Zero-byte transfer: a valid single direct leg with no work.
         Leg z;
@@ -183,6 +188,10 @@ PlanResult DefaultRoutePlanner::plan(const PlannerInput& in) const {
     // Same-domain transfers (host to host, device to device, file to file, shared
     // to shared) are direct single-leg moves. Build that leg directly.
     if (start == goal) {
+        if (in.policy.require_staging) {
+            res.reason = "policy requires a staged route";
+            return res;
+        }
         const char* backend = nullptr;
         switch (start) {
             case MemoryDomain::device:  backend = backend_name::cuda(); break;
@@ -191,7 +200,7 @@ PlanResult DefaultRoutePlanner::plan(const PlannerInput& in) const {
             case MemoryDomain::mmap:    backend = backend_name::host(); break;
             default:                    backend = backend_name::host(); break;
         }
-        if (backend_known(backend, in.available_backends)) {
+        if (backend_known(backend, in.available_backends) && in.policy.backend_allowed(backend)) {
             Leg L;
             L.source_kind = kind_of_domain(start);
             L.dest_kind = kind_of_domain(goal);

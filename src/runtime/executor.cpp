@@ -63,10 +63,14 @@ Error hash_endpoint_region(std::shared_ptr<EndpointRecord> ep, byte_offset offse
         byte_count done = 0;
         while (done < len) {
             byte_count n = (len - done) > tmp_sz ? tmp_sz : (len - done);
-            LARGE_INTEGER li; li.QuadPart = static_cast<LONGLONG>(ep->desc.offset + offset + done);
-            SetFilePointerEx(h, li, nullptr, FILE_BEGIN);
+            // Positional read: the handle is shared with every transfer that
+            // uses this endpoint, so the file pointer is never relied on.
+            const byte_offset pos = ep->desc.offset + offset + done;
+            OVERLAPPED ov{};
+            ov.Offset = static_cast<DWORD>(pos & 0xFFFFFFFFu);
+            ov.OffsetHigh = static_cast<DWORD>(pos >> 32);
             DWORD rd = 0;
-            if (!ReadFile(h, buf.data(), static_cast<DWORD>(n), &rd, nullptr) || static_cast<byte_count>(rd) != n) {
+            if (!ReadFile(h, buf.data(), static_cast<DWORD>(n), &rd, &ov) || static_cast<byte_count>(rd) != n) {
                 return Error(ErrorCategory::integrity_failure, "hash: short read");
             }
             if (use_crc) crc.update(buf.data(), n); else sha.update(buf.data(), n);
@@ -197,7 +201,7 @@ Error run_transfer(RunContext& ctx) {
             out.kind = ep->desc.kind;
             if (is_storage(ep->desc.kind)) {
                 out.obj = ep->file_handle;
-                out.off = c.source_offset;
+                out.off = ep->desc.offset + c.source_offset;   // chunk offsets are relative to the region
             } else {
                 out.ptr = static_cast<char*>(ep->desc.base) + c.source_offset;
             }
@@ -208,7 +212,7 @@ Error run_transfer(RunContext& ctx) {
             out.kind = ep->desc.kind;
             if (is_storage(ep->desc.kind)) {
                 out.obj = ep->file_handle;
-                out.off = c.dest_offset;
+                out.off = ep->desc.offset + c.dest_offset;
             } else {
                 out.ptr = static_cast<char*>(ep->desc.base) + c.dest_offset;
             }
@@ -305,6 +309,9 @@ Error run_transfer(RunContext& ctx) {
             if (ctx.telemetry) ctx.telemetry->staging_pool_hit(false);
         }
     }
+    // The reservation is gone: the record must not hand the same buffers back
+    // a second time when the transfer is retired.
+    rec->staging_bufs.clear();
     // Destroy streams.
     if (use_async) for (auto* s : streams) stream_backend->destroy_stream(s);
 

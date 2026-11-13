@@ -5,6 +5,7 @@
 #include <vector>
 #include <cstring>
 #include <cstdio>
+#include <string>
 
 using namespace transfer_fabric;
 
@@ -130,5 +131,65 @@ TF_TEST(cuda_cleanup_zero) {
     cudaMemGetInfo(&free1, &total1);
     TF_CHECK(free1 >= free0 - (size_t)(4u<<20));   // no large leak (allow small slack)
 }
+
+#if defined(_WIN32)
+// file -> pinned staging -> device: the asynchronous pipeline, several
+// transfers at a time, on staging buffers that earlier transfers gave back.
+TF_TEST(cuda_staged_file_to_device) {
+    if (!cuda_available()) { TF_CHECK(true); return; }
+    const int N = 4;
+    const std::size_t n = 1u << 20;
+    char dir[MAX_PATH + 1];
+    DWORD dn = GetTempPathA(sizeof(dir), dir);
+    const std::string tmp(dn != 0 && dn <= sizeof(dir) ? dir : "");
+    std::vector<std::vector<std::uint8_t>> host(N, std::vector<std::uint8_t>(n));
+    std::vector<std::string> paths(N);
+    std::vector<void*> dev(N, nullptr);
+    for (int i=0;i<N;++i) {
+        for (std::size_t j=0;j<n;++j) host[i][j] = (std::uint8_t)((j*5 + (j>>10) + (std::size_t)i*61) & 0xFF);
+        paths[i] = tmp + "tf_cuda_stage_" + std::to_string(i) + ".bin";
+        HANDLE f = CreateFileA(paths[i].c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        TF_REQUIRE(f != INVALID_HANDLE_VALUE);
+        DWORD w = 0;
+        const BOOL wrote = WriteFile(f, host[i].data(), (DWORD)n, &w, nullptr);
+        CloseHandle(f);
+        TF_REQUIRE(wrote && w == (DWORD)n);
+        TF_REQUIRE(cudaMalloc(&dev[i], n) == cudaSuccess);
+    }
+    int unfinished = 0, wrong = 0;
+    {
+        Runtime rt({});
+        std::vector<EndpointHandle> fe(N), de(N);
+        for (int i=0;i<N;++i) {
+            TF_REQUIRE(rt.register_endpoint(EndpointDescriptor::file_region(paths[i], 0, n), fe[i]).ok());
+            TF_REQUIRE(rt.register_endpoint(EndpointDescriptor::device_memory(g_device, dev[i], n), de[i]).ok());
+        }
+        PlanResult pr = rt.plan(fe[0], de[0], n, TransferPolicy{});
+        TF_REQUIRE(pr.found);
+        TF_CHECK(!pr.best.is_direct());
+        std::vector<std::uint8_t> readback(n, 0);
+        for (int round=0; round<4; ++round) {
+            for (int i=0;i<N;++i) TF_REQUIRE(cudaMemset(dev[i], 0, n) == cudaSuccess);
+            std::vector<TransferHandle> hs(N);
+            for (int i=0;i<N;++i) {
+                TransferOptions o; o.source=fe[i]; o.destination=de[i];
+                o.policy.integrity_mode = VerificationMode::crc32c;
+                Error e; hs[i] = rt.submit(o, e);
+                TF_REQUIRE(e.ok());
+            }
+            for (int i=0;i<N;++i) {
+                if (!rt.wait(hs[i])) { ++unfinished; continue; }
+                TF_REQUIRE(cudaMemcpy(readback.data(), dev[i], n, cudaMemcpyDeviceToHost) == cudaSuccess);
+                if (std::memcmp(host[i].data(), readback.data(), n)!=0) ++wrong;
+            }
+        }
+        rt.shutdown();
+    }
+    TF_EQ(unfinished, 0);
+    TF_EQ(wrong, 0);
+    for (int i=0;i<N;++i) { TF_CHECK(cudaFree(dev[i]) == cudaSuccess); DeleteFileA(paths[i].c_str()); }
+    TF_CHECK(cudaGetLastError() == cudaSuccess);
+}
+#endif
 
 TF_TEST_MAIN()

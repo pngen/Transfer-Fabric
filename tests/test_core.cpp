@@ -11,6 +11,9 @@
 #include <vector>
 #include <cstring>
 #include <cstdint>
+#include <atomic>
+#include <thread>
+#include <unordered_set>
 
 using namespace transfer_fabric;
 
@@ -254,6 +257,183 @@ TF_TEST(core_accounting) {
     TF_EQ(s.bytes_moved, (byte_count)(10u * (1u<<16)));
     TF_EQ(s.transfers_active, 0u);
     rt.shutdown();
+}
+
+// ---- Transfer identity ------------------------------------------------
+// Ids are generated from any thread; no two of them are ever the same.
+TF_TEST(core_transfer_id_unique_across_threads) {
+    const int T = 8, PER = 100000;
+    std::vector<std::vector<TransferId>> ids(T);
+    std::vector<std::thread> threads;
+    for (int t=0;t<T;++t) threads.emplace_back([&ids, t]{
+        ids[t].reserve(PER);
+        for (int i=0;i<PER;++i) ids[t].push_back(TransferId::generate());
+    });
+    for (auto& th : threads) th.join();
+    std::unordered_set<TransferId> all;
+    all.reserve(static_cast<std::size_t>(T) * PER);
+    for (auto& v : ids) for (auto& id : v) all.insert(id);
+    TF_EQ(all.size(), static_cast<std::size_t>(T) * PER);
+}
+
+// An id names one transfer: a second submission under the same id is refused
+// and the first transfer stays reachable through it.
+TF_TEST(core_explicit_id_is_not_reused) {
+    std::vector<std::uint8_t> a(4096, 1), b(4096, 0), c(4096, 2), d(4096, 0);
+    Runtime rt({});
+    EndpointHandle sa, db, sc, dd;
+    TF_REQUIRE(rt.register_endpoint(EndpointDescriptor::host_memory(a.data(), a.size()), sa).ok());
+    TF_REQUIRE(rt.register_endpoint(EndpointDescriptor::host_memory(b.data(), b.size()), db).ok());
+    TF_REQUIRE(rt.register_endpoint(EndpointDescriptor::host_memory(c.data(), c.size()), sc).ok());
+    TF_REQUIRE(rt.register_endpoint(EndpointDescriptor::host_memory(d.data(), d.size()), dd).ok());
+    TransferOptions first; first.source=sa; first.destination=db; first.explicit_id.id = TransferId(7, 7);
+    Error err;
+    TransferHandle h1 = rt.submit(first, err);
+    TF_REQUIRE(err.ok());
+    TF_REQUIRE(rt.wait(h1));
+    TransferOptions second; second.source=sc; second.destination=dd; second.explicit_id.id = TransferId(7, 7);
+    TransferHandle h2 = rt.submit(second, err);
+    TF_CHECK(!err.ok());
+    TF_CHECK(!h2.valid());
+    TF_CHECK(rt.wait(h1));                     // whatever the id names now has finished
+    TF_CHECK(rt.inspect(h1).source == sa);     // ...and it is still the first transfer
+    TF_CHECK(d[0] == 0);                       // the refused one moved nothing
+    TF_CHECK(b[0] == 1);
+    rt.shutdown();
+}
+
+// A submission that is rejected is not a transfer: nothing is left under its
+// id, least of all a record that never reaches a terminal state.
+TF_TEST(core_rejected_submit_leaves_no_transfer) {
+    std::vector<std::uint8_t> a(4096, 5), b(4096, 0);
+    Runtime rt({});
+    EndpointHandle sa, db;
+    TF_REQUIRE(rt.register_endpoint(EndpointDescriptor::host_memory(a.data(), a.size()), sa).ok());
+    TF_REQUIRE(rt.register_endpoint(EndpointDescriptor::host_memory(b.data(), b.size()), db).ok());
+    TransferOptions o; o.source=sa; o.destination=db; o.explicit_id.id = TransferId(9, 9);
+    o.dependencies.push_back(TransferId(123, 456));   // never submitted
+    Error err;
+    TransferHandle h = rt.submit(o, err);
+    TF_CHECK(!err.ok());
+    TF_CHECK(!h.valid());
+    TransferHandle named; named.id = TransferId(9, 9);
+    TF_CHECK(rt.status(named).error.category == ErrorCategory::stale_generation);   // unknown transfer
+    // The id is still free for a real submission.
+    o.dependencies.clear();
+    h = rt.submit(o, err);
+    TF_REQUIRE(err.ok());
+    TF_CHECK(rt.wait(h));
+    TF_CHECK(b == a);
+    rt.shutdown();
+}
+
+// ---- Ranges -----------------------------------------------------------
+// Only an unset range means "the whole region". A zero-length range at an
+// offset is empty: it moves nothing and cannot receive anything.
+TF_TEST(core_zero_length_range_moves_nothing) {
+    std::vector<std::uint8_t> src(4096, 0xAA), dst(4096, 0x11);
+    Runtime rt({});
+    EndpointHandle se, de;
+    TF_REQUIRE(rt.register_endpoint(EndpointDescriptor::host_memory(src.data(), src.size()), se).ok());
+    TF_REQUIRE(rt.register_endpoint(EndpointDescriptor::host_memory(dst.data(), dst.size()), de).ok());
+    TransferOptions o; o.source=se; o.destination=de;
+    o.source_range = ByteRange{100, 0};
+    o.destination_range = ByteRange{200, 0};
+    Error err;
+    TransferHandle h = rt.submit(o, err);
+    TF_REQUIRE(err.ok());
+    TF_REQUIRE(rt.wait(h));
+    TF_EQ(rt.status(h).bytes_completed, (byte_count)0);
+    bool untouched = true; for (auto v : dst) untouched = untouched && v == 0x11;
+    TF_CHECK(untouched);
+    TransferOptions p; p.source=se; p.destination=de;
+    p.source_range = ByteRange{0, 64};
+    p.destination_range = ByteRange{200, 0};
+    TransferHandle h2 = rt.submit(p, err);
+    TF_CHECK(!err.ok());
+    if (err.ok()) rt.wait(h2);
+    rt.shutdown();
+}
+
+// ---- Policy -----------------------------------------------------------
+// The backend allowlist and the staging requirement gate admission.
+TF_TEST(core_policy_gates_admission) {
+    std::vector<std::uint8_t> a(4096, 3), b(4096, 0);
+    Runtime rt({});
+    EndpointHandle sa, db;
+    TF_REQUIRE(rt.register_endpoint(EndpointDescriptor::host_memory(a.data(), a.size()), sa).ok());
+    TF_REQUIRE(rt.register_endpoint(EndpointDescriptor::host_memory(b.data(), b.size()), db).ok());
+    // host -> host moves through the host backend.
+    TransferPolicy only_file; only_file.backend_allowlist = {backend_name::file()};
+    TF_CHECK(!rt.plan(sa, db, 4096, only_file).found);
+    TransferPolicy host_ok; host_ok.backend_allowlist = {backend_name::host()};
+    TF_CHECK(rt.plan(sa, db, 4096, host_ok).found);
+    TransferOptions o; o.source=sa; o.destination=db; o.policy = only_file;
+    Error err;
+    TransferHandle h = rt.submit(o, err);
+    TF_CHECK(!err.ok());
+    if (err.ok()) rt.wait(h);
+    TF_CHECK(b[0] == 0);
+    // A policy that requires staging is not satisfied by a direct move.
+    TransferPolicy staged_only; staged_only.require_staging = true;
+    TF_CHECK(!rt.plan(sa, db, 4096, staged_only).found);
+    rt.shutdown();
+}
+
+// ---- Batches ----------------------------------------------------------
+// Batch handles are generation-aware like endpoint handles: an ended, stale
+// or forged handle is rejected.
+TF_TEST(core_batch_handles_are_generational) {
+    std::vector<std::uint8_t> a(4096, 4), b(4096, 0);
+    Runtime rt({});
+    BatchHandle first;
+    TF_REQUIRE(rt.begin_batch(first).ok());
+    TF_CHECK(rt.end_batch(first).ok());
+    TF_CHECK(!rt.end_batch(first).ok());          // already ended
+    BatchHandle second;
+    TF_REQUIRE(rt.begin_batch(second).ok());
+    TF_CHECK(!(second == first));                  // the slot may be reused, the handle is not
+    TF_CHECK(!rt.end_batch(first).ok());          // the old handle does not end the new batch
+    BatchHandle forged = second; forged.generation += 1;
+    TF_CHECK(!rt.end_batch(forged).ok());
+    EndpointHandle sa, db;
+    TF_REQUIRE(rt.register_endpoint(EndpointDescriptor::host_memory(a.data(), a.size()), sa).ok());
+    TF_REQUIRE(rt.register_endpoint(EndpointDescriptor::host_memory(b.data(), b.size()), db).ok());
+    // A transfer cannot join a batch that is over.
+    TransferOptions o; o.source=sa; o.destination=db; o.batch = first;
+    Error err;
+    TransferHandle h = rt.submit(o, err);
+    TF_CHECK(!err.ok());
+    if (err.ok()) rt.wait(h);
+    o.batch = second;
+    h = rt.submit(o, err);
+    TF_REQUIRE(err.ok());
+    TF_CHECK(rt.wait(h));
+    TF_CHECK(rt.end_batch(second).ok());
+    rt.shutdown();
+}
+
+// ---- Staging pool: idle buffers ---------------------------------------
+// Cached buffers that nothing uses do not exhaust the pool for requests of
+// another size; memory that is in use is never given up.
+TF_TEST(core_staging_pool_reclaims_idle_buffers) {
+    StagingPool pool(PoolKind::host, std::make_shared<HostAllocator>(), 4096, 64);
+    auto small_buf = pool.allocate(1024, true);
+    TF_REQUIRE(small_buf.has_value());
+    pool.release(*small_buf);                      // idle, cached for reuse
+    auto big = pool.allocate(4096, true);
+    TF_REQUIRE(big.has_value());                   // nothing is in use: the whole capacity is available
+    TF_EQ(pool.allocated_bytes(), (byte_count)4096);
+    TF_CHECK(!pool.allocate(1024, true).has_value());   // still bounded
+    pool.release(*big);
+    std::atomic<bool> cancel{false};
+    StagingBuffer again = pool.allocate_blocking(1024, cancel);
+    TF_CHECK(again.valid());
+    TF_EQ(pool.allocated_bytes(), (byte_count)1024);
+    pool.release(again);
+    pool.drain();
+    TF_EQ(pool.usage(), 0u);
+    TF_EQ(pool.allocated_bytes(), 0u);
 }
 
 TF_TEST_MAIN()

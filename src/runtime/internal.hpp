@@ -93,6 +93,7 @@ private:
 // Transfer id -> record registry.
 class TransferRegistry {
 public:
+    // Returns the record, or null when the id already names a transfer.
     std::shared_ptr<TransferRecord> insert(const TransferId& id,
                                            std::shared_ptr<TransferRecord> rec);
     std::shared_ptr<TransferRecord> find(const TransferId& id) const;

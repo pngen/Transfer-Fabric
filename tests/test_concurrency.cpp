@@ -110,4 +110,28 @@ TF_TEST(concurrency_shutdown_with_queued) {
     TF_EQ(s.transfers_active, 0u);
 }
 
+// The terminal state is the last thing a transfer publishes: from the moment
+// it can be observed, the accounting for that transfer is final.
+TF_TEST(concurrency_terminal_state_is_published_last) {
+    std::vector<std::uint8_t> a(64, 1), b(64, 0);
+    Runtime rt({});
+    EndpointHandle se, de;
+    TF_REQUIRE(rt.register_endpoint(EndpointDescriptor::host_memory(a.data(), a.size()), se).ok());
+    TF_REQUIRE(rt.register_endpoint(EndpointDescriptor::host_memory(b.data(), b.size()), de).ok());
+    const int N = 50000;
+    int late = 0;
+    for (int i=0;i<N;++i) {
+        TransferOptions o; o.source=se; o.destination=de; Error e;
+        TransferHandle h = rt.submit(o, e);
+        TF_REQUIRE(e.ok());
+        // Poll instead of waiting, to look at the counters the instant the
+        // state turns terminal.
+        while (!is_terminal(rt.status(h).state)) { }
+        auto s = rt.telemetry();
+        if (s.transfers_completed != (std::uint64_t)(i + 1) || s.transfers_active != 0) ++late;
+    }
+    TF_EQ(late, 0);
+    rt.shutdown();
+}
+
 TF_TEST_MAIN()

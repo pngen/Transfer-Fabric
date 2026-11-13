@@ -119,7 +119,10 @@ TF_TEST(property_failure_injection) {
     // 5. Short file read -> hard failure (file smaller than requested region).
 #if defined(_WIN32)
     {
-        std::string P = "C:\\Temp\\tf_prop_short.bin";
+        // The file lives in the system temporary directory (it exists on every machine).
+        char dir[MAX_PATH + 1];
+        DWORD dn = GetTempPathA(sizeof(dir), dir);
+        std::string P = std::string(dn != 0 && dn <= sizeof(dir) ? dir : "") + "tf_prop_short.bin";
         HANDLE h = CreateFileA(P.c_str(), GENERIC_WRITE,0,nullptr,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,nullptr);
         if (h != INVALID_HANDLE_VALUE) { std::uint8_t z=0; DWORD w=0; WriteFile(h,&z,1,&w,nullptr); CloseHandle(h); }
         std::vector<std::uint8_t> buf(4096, 0);

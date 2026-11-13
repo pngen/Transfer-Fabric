@@ -24,6 +24,9 @@ namespace transfer_fabric {
 
 EndpointRecord::~EndpointRecord() {
 #if defined(_WIN32)
+    // The view goes first: while it is mapped the region (and a mapped file)
+    // stays held no matter which handles are closed.
+    if (shm_map) { UnmapViewOfFile(shm_map); shm_map = nullptr; }
     if (file_handle) { CloseHandle(reinterpret_cast<HANDLE>(static_cast<std::uintptr_t>(file_handle))); file_handle = 0; }
     if (shm_handle) { CloseHandle(reinterpret_cast<HANDLE>(static_cast<std::uintptr_t>(shm_handle))); shm_handle = 0; }
 #endif
@@ -133,6 +136,14 @@ struct Runtime::Impl {
         return v;
     }
 
+    // A batch handle is live while its slot is open under the same generation.
+    bool batch_open(const BatchHandle& b) {
+        std::lock_guard<std::mutex> g(batch_mtx);
+        if (b.slot == 0 || b.slot > batch_slots.size()) return false;
+        const auto& slot = batch_slots[b.slot - 1];
+        return slot.second != 0 && slot.first == b.generation;
+    }
+
     // ---- helpers ---------------------------------------------------
     void set_state(const std::shared_ptr<TransferRecord>& rec, TransferState s) {
         std::lock_guard<std::mutex> g(rec->mtx);
@@ -155,8 +166,17 @@ struct Runtime::Impl {
         nodes.push_back(route.legs[0].source_domain);
         for (const auto& L : route.legs) nodes.push_back(L.dest_domain);
         const std::size_t nnodes = nodes.size();
-        rec->staging_bufs.assign(nnodes, {});
         const std::size_t depth = cfg.pipeline_depth > 0 ? cfg.pipeline_depth : 2;
+        // The policy bounds how much staging one transfer may hold.
+        if (nnodes > 2) {
+            byte_count per_node = 0, need = 0;
+            if (!checked_mul(rec->chunk_plan.chunk_size(), static_cast<byte_count>(depth), per_node) ||
+                !checked_mul(per_node, static_cast<byte_count>(nnodes - 2), need) ||
+                need > rec->opts.policy.max_staging_bytes) {
+                return Error(ErrorCategory::quota_exceeded, "staging exceeds the policy limit");
+            }
+        }
+        rec->staging_bufs.assign(nnodes, {});
         for (std::size_t j = 1; j + 1 < nnodes; ++j) {
             StagingPool* pool = (nodes[j] == MemoryDomain::host_pinned) ? pinned_pool.get() : host_pool.get();
             std::vector<StagingBuffer>& bufs = rec->staging_bufs[j];
@@ -211,7 +231,12 @@ struct Runtime::Impl {
         else if (e.category == ErrorCategory::cancellation) terminal = TransferState::cancelled;
         else terminal = TransferState::failed;
 
-        set_terminal(rec, terminal, e);
+        // The terminal state is published last. Whoever sees it sees a transfer
+        // that holds nothing any more (staging, endpoints) and whose accounting
+        // is final.
+        release_staging(rec);
+        rec->src_ep.reset();
+        rec->dst_ep.reset();
         if (rec->started.exchange(false, std::memory_order_relaxed)) telemetry.transfer_done();
 
         if (e.ok()) {
@@ -236,7 +261,7 @@ struct Runtime::Impl {
             }
         }
 
-        release_staging(rec);
+        set_terminal(rec, terminal, e);
         resolve_dependents(rec->handle.id, e.ok());
     }
 
@@ -346,7 +371,7 @@ Error Runtime::register_endpoint(const EndpointDescriptor& desc, EndpointHandle&
     if (shutdown_.load()) { out = {}; return Error(ErrorCategory::invalid_request, "runtime shutting down"); }
     if (!desc.valid()) { out = {}; return Error(ErrorCategory::invalid_request, "invalid endpoint descriptor"); }
 
-    if (desc.kind == EndpointKind::file && has_parent_component(desc.path)) {
+    if ((desc.kind == EndpointKind::file || desc.kind == EndpointKind::mmap) && has_parent_component(desc.path)) {
         out = {}; return Error(ErrorCategory::permission_denied, "path traversal in file path");
     }
 
@@ -365,22 +390,43 @@ Error Runtime::register_endpoint(const EndpointDescriptor& desc, EndpointHandle&
         }
         LARGE_INTEGER sz; sz.QuadPart = 0;
         if (!GetFileSizeEx(h, &sz)) { CloseHandle(h); out = {}; return Error(ErrorCategory::backend_failure, "cannot stat file"); }
+        const byte_count file_size = static_cast<byte_count>(sz.QuadPart);
+        if (desc.offset > file_size) {
+            CloseHandle(h); out = {};
+            return Error(ErrorCategory::invalid_request, "file region starts beyond the end of the file");
+        }
         rec->file_handle = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(h));
-        rec->caps.max_transfer_size = static_cast<byte_count>(sz.QuadPart) - desc.offset;
+        // The endpoint is the declared region, bounded by what the file holds
+        // (a declared size of zero means "to the end of the file").
+        const byte_count remaining = file_size - desc.offset;
+        rec->caps.max_transfer_size = (desc.size != 0 && desc.size < remaining) ? desc.size : remaining;
     } else if (desc.kind == EndpointKind::shared) {
+        // The named mapping has to cover the region [offset, offset + size).
+        byte_count span = 0;
+        if (!checked_add(desc.offset, desc.size, span)) {
+            out = {}; return Error(ErrorCategory::invalid_request, "shared region overflows");
+        }
         HANDLE hMap = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
-                                         0, static_cast<DWORD>(desc.size), desc.path.c_str());
+                                         static_cast<DWORD>(span >> 32),
+                                         static_cast<DWORD>(span & 0xFFFFFFFFu), desc.path.c_str());
         if (hMap == NULL) { out = {}; return Error(ErrorCategory::backend_failure, "cannot create shared mapping"); }
-        void* p = MapViewOfFile(hMap, FILE_MAP_ALL_ACCESS, 0, 0, desc.size);
+        void* p = MapViewOfFile(hMap, FILE_MAP_ALL_ACCESS, 0, 0, static_cast<SIZE_T>(span));
         if (!p) { CloseHandle(hMap); out = {}; return Error(ErrorCategory::backend_failure, "cannot map shared memory"); }
         rec->shm_handle = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(hMap));
-        rec->shm_map = p; rec->shm_len = desc.size;
-        rec->desc.base = p; // resolved address
+        rec->shm_map = p; rec->shm_len = span;
+        rec->desc.base = static_cast<char*>(p) + desc.offset; // resolved address of the region
     } else if (desc.kind == EndpointKind::mmap) {
         HANDLE hFile = CreateFileA(desc.path.c_str(), GENERIC_READ | GENERIC_WRITE,
                                    FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                                    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (hFile == INVALID_HANDLE_VALUE) { out = {}; return Error(ErrorCategory::backend_failure, "cannot open mmap file"); }
+        LARGE_INTEGER msz; msz.QuadPart = 0;
+        if (!GetFileSizeEx(hFile, &msz)) { CloseHandle(hFile); out = {}; return Error(ErrorCategory::backend_failure, "cannot stat mmap file"); }
+        const byte_count mapped_size = static_cast<byte_count>(msz.QuadPart);
+        if (desc.offset > mapped_size) {
+            CloseHandle(hFile); out = {};
+            return Error(ErrorCategory::invalid_request, "mmap region starts beyond the end of the file");
+        }
         HANDLE hMap = CreateFileMappingA(hFile, nullptr, PAGE_READWRITE, 0, 0, nullptr);
         if (hMap == NULL) { CloseHandle(hFile); out = {}; return Error(ErrorCategory::backend_failure, "cannot map file"); }
         void* p = MapViewOfFile(hMap, FILE_MAP_ALL_ACCESS, 0, 0, 0);
@@ -388,7 +434,10 @@ Error Runtime::register_endpoint(const EndpointDescriptor& desc, EndpointHandle&
         rec->file_handle = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(hFile));
         rec->shm_handle = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(hMap));
         rec->shm_map = p;
-        rec->desc.base = p;
+        // The endpoint is the declared region, bounded by what is mapped.
+        const byte_count remaining = mapped_size - desc.offset;
+        if (rec->caps.max_transfer_size > remaining) rec->caps.max_transfer_size = remaining;
+        rec->desc.base = static_cast<char*>(p) + desc.offset;
     }
 #endif
 
@@ -444,12 +493,14 @@ Error resolve_ranges(const std::shared_ptr<EndpointRecord>& se, const std::share
                      ByteRange& srcRange, ByteRange& dstRange, byte_count& bytes) {
     byte_count srcsize = se->caps.max_transfer_size;
     byte_count dstsize = de->caps.max_transfer_size;
-    if (srcRange.empty()) srcRange = ByteRange{0, srcsize};
+    // Only a range that was left unset stands for "the whole region"; a
+    // zero-length range at an offset is an empty range and moves nothing.
+    if (srcRange == ByteRange{}) srcRange = ByteRange{0, srcsize};
     if (srcRange.offset > srcsize || srcRange.length > (srcsize - srcRange.offset)) {
         return Error(ErrorCategory::invalid_request, "source range out of bounds");
     }
     bytes = srcRange.length;
-    if (dstRange.empty()) dstRange = ByteRange{0, bytes};
+    if (dstRange == ByteRange{}) dstRange = ByteRange{0, bytes};
     if (dstRange.length < bytes) {
         return Error(ErrorCategory::invalid_request, "destination range too small");
     }
@@ -467,6 +518,9 @@ TransferHandle Runtime::submit(const TransferOptions& opts, Error& err) {
     auto se = impl_->endpoints.get(opts.source);
     auto de = impl_->endpoints.get(opts.destination);
     if (!se || !de) { err = Error(ErrorCategory::stale_generation, "invalid endpoint handle"); return out; }
+    if (opts.batch.valid() && !impl_->batch_open(opts.batch)) {
+        err = Error(ErrorCategory::stale_generation, "stale batch handle"); return out;
+    }
 
     // Resolve ranges.
     ByteRange srcRange = opts.source_range;
@@ -499,6 +553,17 @@ TransferHandle Runtime::submit(const TransferOptions& opts, Error& err) {
         cp = ChunkPlan::build(ChunkPlanInput{bytes, srcRange.offset, dstRange.offset, minc, maxc, preferred, align});
     } catch (...) { err = Error(ErrorCategory::invalid_request, "chunk plan failed"); return out; }
 
+    // Dependencies must name transfers this runtime knows. They are looked up
+    // before the transfer is admitted, so a rejected submission leaves no
+    // record behind.
+    std::vector<std::shared_ptr<TransferRecord>> deps;
+    deps.reserve(opts.dependencies.size());
+    for (const TransferId& d : opts.dependencies) {
+        auto dep = impl_->transfers.find(d);
+        if (!dep) { err = Error(ErrorCategory::invalid_request, "unknown dependency"); return out; }
+        deps.push_back(std::move(dep));
+    }
+
     auto rec = std::make_shared<TransferRecord>();
     rec->handle.id = opts.explicit_id.valid() ? opts.explicit_id.id : TransferId::generate();
     rec->opts = opts;
@@ -515,34 +580,31 @@ TransferHandle Runtime::submit(const TransferOptions& opts, Error& err) {
     rec->deps_failed.store(0);
     rec->status.attempt = 1;
 
-    impl_->transfers.insert(rec->handle.id, rec);
+    if (!impl_->transfers.insert(rec->handle.id, rec)) {
+        err = Error(ErrorCategory::invalid_request, "transfer id already in use");
+        return out;
+    }
     impl_->telemetry.transfer_created();
     impl_->telemetry.add_bytes_requested(bytes);
     impl_->telemetry.add_chunks(cp.chunk_count());
     impl_->set_state(rec, TransferState::planned);
 
-    if (!opts.dependencies.empty()) {
-        // Synchronous dependency resolution: wait for each dependency to reach a
-        // terminal state; if any failed, this transfer fails before executing.
-        for (const TransferId& d : opts.dependencies) {
-            auto dep = impl_->transfers.find(d);
-            if (!dep) { err = Error(ErrorCategory::invalid_request, "unknown dependency"); return out; }
-            bool dcomp = false;
-            {
-                std::unique_lock<std::mutex> l(dep->mtx);
-                dep->cv.wait(l, [&] { return dep->notified && is_terminal(dep->status.state); });
-                dcomp = dep->status.state == TransferState::completed;
-            }
-            if (!dcomp) {
-                err = Error(ErrorCategory::permanent_failure, "a dependency failed");
-                impl_->set_terminal(rec, TransferState::failed, err);
-                return out;
-            }
+    // Synchronous dependency resolution: wait for each dependency to reach a
+    // terminal state; if any failed, this transfer fails before executing.
+    for (const auto& dep : deps) {
+        bool dcomp = false;
+        {
+            std::unique_lock<std::mutex> l(dep->mtx);
+            dep->cv.wait(l, [&] { return dep->notified && is_terminal(dep->status.state); });
+            dcomp = dep->status.state == TransferState::completed;
         }
-        impl_->queue_transfer(rec);
-    } else {
-        impl_->queue_transfer(rec);
+        if (!dcomp) {
+            err = Error(ErrorCategory::permanent_failure, "a dependency failed");
+            impl_->finalize(rec, err);
+            return out;
+        }
     }
+    impl_->queue_transfer(rec);
     out = rec->handle;
     return out;
 }
@@ -603,11 +665,14 @@ Error Runtime::begin_batch(BatchHandle& out) {
     std::size_t index;
     if (!impl_->batch_free.empty()) { index = impl_->batch_free.back(); impl_->batch_free.pop_back(); }
     else { index = impl_->batch_slots.size(); impl_->batch_slots.emplace_back(); }
-    // generation
-    // use index+1 slot, gen increments
-    impl_->batch_slots[index].second = 0;
+    // The slot's generation changes every time it is handed out, so a handle
+    // from an earlier use of the slot no longer matches. `second` marks the
+    // batch as open.
+    auto& slot = impl_->batch_slots[index];
+    if (++slot.first == 0) ++slot.first;
+    slot.second = 1;
     out.slot = index + 1;
-    out.generation = index + 1; // simple monotonic per slot for now
+    out.generation = slot.first;
     impl_->telemetry.add_batch();
     return Error();
 }
@@ -615,7 +680,12 @@ Error Runtime::begin_batch(BatchHandle& out) {
 Error Runtime::end_batch(const BatchHandle& batch) {
     std::lock_guard<std::mutex> g(impl_->batch_mtx);
     if (batch.slot == 0 || batch.slot > impl_->batch_slots.size()) return Error(ErrorCategory::invalid_request, "bad batch");
-    impl_->batch_slots[batch.slot - 1].second = 0;
+    auto& slot = impl_->batch_slots[batch.slot - 1];
+    if (slot.second == 0 || slot.first != batch.generation) {
+        return Error(ErrorCategory::stale_generation, "stale batch handle");
+    }
+    slot.second = 0;
+    impl_->batch_free.push_back(batch.slot - 1);
     return Error();
 }
 

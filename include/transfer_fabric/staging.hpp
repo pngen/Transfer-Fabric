@@ -88,6 +88,9 @@ public:
 
 private:
     void adjust_high_water() noexcept;
+    // Frees idle (cached, not in use) buffers until a new allocation of `bytes`
+    // fits the capacity. Caller holds mu_.
+    void trim_idle(byte_count bytes);
     void* do_allocate(byte_count bytes);
     void  do_free(void* ptr, byte_count bytes);
 

@@ -180,12 +180,17 @@ Error TcpChunkServer::serve_once() {
             }
         }
     }
+    // The range comes from the peer: it is checked before it is used.
+    byte_count req_end = 0;
+    if (!checked_add(req_offset, req_len, req_end)) {
+        ::closesocket(cs); return Error(ErrorCategory::invalid_request, "requested range overflows");
+    }
     std::uint64_t fh = 0; Error fe;
     if (!open_read_file(src_path, fh, fe)) { ::closesocket(cs); return fe; }
     bool ok = true;
     ChunkPlanInput ci;
     ci.total = req_len;
-    ci.source_offset = 0;
+    ci.source_offset = req_offset;   // the region starts where the client asked
     ci.dest_offset = req_offset;
     ci.min_chunk = 4096;
     ci.max_chunk = Protocol::kMaxPayload;
@@ -199,9 +204,9 @@ Error TcpChunkServer::serve_once() {
         std::vector<std::uint8_t> payload(static_cast<std::size_t>(c.length));
         HANDLE h = reinterpret_cast<HANDLE>(static_cast<std::uintptr_t>(fh));
         LARGE_INTEGER li; li.QuadPart = static_cast<LONGLONG>(c.source_offset);
-        SetFilePointerEx(h, li, nullptr, FILE_BEGIN);
         DWORD rd = 0;
-        if (!ReadFile(h, payload.data(), static_cast<DWORD>(c.length), &rd, nullptr) ||
+        if (!SetFilePointerEx(h, li, nullptr, FILE_BEGIN) ||
+            !ReadFile(h, payload.data(), static_cast<DWORD>(c.length), &rd, nullptr) ||
             static_cast<byte_count>(rd) != c.length) {
             ok = false; break;
         }
@@ -282,6 +287,8 @@ Error TcpChunkClient::transfer(const std::string& src_path, byte_offset offset,
 #if defined(_WIN32)
     sock_t cs = static_cast<sock_t>(sock_);
     if (cs == kInvalid || cs == 0) return Error(ErrorCategory::invalid_request, "not connected");
+    byte_count range_end = 0;
+    if (!checked_add(offset, length, range_end)) return Error(ErrorCategory::invalid_request, "requested range overflows");
     FrameDecoder dec;
     // hello
     {
@@ -321,13 +328,21 @@ Error TcpChunkClient::transfer(const std::string& src_path, byte_offset offset,
         if (!f) { if (!e.ok()) { result = e; break; } continue; }
         FrameType t = static_cast<FrameType>(f->header.type);
         if (t == FrameType::chunk) {
-            // Validate ordering, id, and bounds.
+            // Validate ordering, id, and bounds. A chunk is accepted only as the
+            // next piece of this transfer: it starts where the previous one
+            // ended, carries exactly the bytes it claims, and stays inside the
+            // requested range. Anything else would let a peer reach the byte
+            // count with the wrong bytes.
+            if (f->header.transfer_id != id) { result = Error(ErrorCategory::invalid_request, "chunk for another transfer"); break; }
             if (f->header.chunk_id != expected_chunk) { result = Error(ErrorCategory::invalid_request, "out-of-order or duplicate chunk"); break; }
-            if (f->header.offset < offset || f->header.offset + f->header.length > offset + length) { result = Error(ErrorCategory::invalid_request, "chunk outside requested range"); break; }
+            if (f->payload.empty() || f->header.length != f->payload.size() ||
+                f->header.offset != offset + written || f->payload.size() > length - written) {
+                result = Error(ErrorCategory::invalid_request, "chunk outside requested range"); break;
+            }
             LARGE_INTEGER li; li.QuadPart = static_cast<LONGLONG>(f->header.offset);
-            SetFilePointerEx(h, li, nullptr, FILE_BEGIN);
             DWORD wr = 0;
-            if (!WriteFile(h, f->payload.data(), static_cast<DWORD>(f->payload.size()), &wr, nullptr) || wr != f->payload.size()) {
+            if (!SetFilePointerEx(h, li, nullptr, FILE_BEGIN) ||
+                !WriteFile(h, f->payload.data(), static_cast<DWORD>(f->payload.size()), &wr, nullptr) || wr != f->payload.size()) {
                 result = Error(ErrorCategory::backend_failure, "write failed"); break;
             }
             written += f->payload.size();
